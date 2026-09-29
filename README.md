@@ -34,6 +34,24 @@ curl -sS http://127.0.0.1:8432/api/system/health
 
 课程任务运营接口使用 `/api/compute` 前缀，身份、角色、审计和系统接口分别位于 `/api/auth`、`/api/roles`、`/api/audit` 与 `/api/system`。
 
+## 两阶段批量操作协议（先查看、后确认）
+
+直接调用旧的 `POST /api/compute/tasks/batch` 会逐条独立提交，任务状态在中途变化时会留下“半批成功”。需要稳妥处理一批任务时，改用预览—确认协议：
+
+1. `POST /api/compute/tasks/batch-protocol/preview`
+   - 通过 `task_ids` 显式列表或 `filter`（status/project_code/requested_by）选择任务；命中的任务集合与筛选条件在预览时被**冻结**。
+   - 逐项返回当前 `version`、`allowed`（是否允许该动作）、`action` 与 `reject_reason`（拒绝理由）。
+   - 返回一次性 `token`（服务端只存摘要）、`preview_digest`（预览摘要）与 `expires_at`。
+   - `execution_mode`：`abort`（默认，确认时若有任何漂移则整体回滚、全部成功才提交）或 `accept_partial`（明确接受逐条结果，漂移项被跳过）。
+2. `POST /api/compute/tasks/batch-protocol/confirm`
+   - 必须回传 `token`、`preview_digest` 与预览发起人 `actor`；服务端核对摘要、确认人和逐项版本。
+   - `token` 在单个即时事务中**只能消费一次**；摘要不符、确认人不符、过期或状态漂移都会被拒绝。
+   - 过期或漂移时在错误 `context.drift` 中逐项给出 `version`/`status` 的预览值与当前值；`abort` 模式下不做任何修改。
+3. `GET /api/compute/tasks/batch-protocol/runs/{token}`
+   - 事后追溯：返回预览摘要、确认人、每项的实际状态变化、对应的 `intervention_id` 以及被跳过的原因。
+
+审计上，预览与确认分别写入 `audit_events` 并以同一 `correlation_id` 关联；每项实际变化写入 `compute_interventions`，其 `batch_key=protocol:<run_id>` 与逐项记录的 `intervention_id` 串联，从而能解释某条为什么被提交或跳过；被拒绝的确认也会留下 `outcome=denied` 的审计记录。
+
 ## 测试与编译检查
 
 ```bash

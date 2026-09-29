@@ -293,6 +293,52 @@ CREATE TABLE IF NOT EXISTS compute_interventions (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_compute_interventions_task ON compute_interventions(task_id,id);
+
+-- 两阶段“先查看、后确认”批量协议：一次预览对应一个运行凭据
+CREATE TABLE IF NOT EXISTS compute_batch_protocol_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    token_digest TEXT NOT NULL UNIQUE,
+    actor TEXT NOT NULL,
+    operation TEXT NOT NULL CHECK(operation IN ('cancel','retry','priority')),
+    reason TEXT NOT NULL,
+    priority INTEGER,
+    execution_mode TEXT NOT NULL CHECK(execution_mode IN ('abort','accept_partial')),
+    selection_json TEXT NOT NULL,
+    preview_digest TEXT NOT NULL,
+    task_count INTEGER NOT NULL,
+    allowed_count INTEGER NOT NULL,
+    rejected_count INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','committed','expired','superseded')),
+    previewed_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    confirmed_at TEXT,
+    confirmed_by TEXT NOT NULL DEFAULT '',
+    committed_count INTEGER NOT NULL DEFAULT 0,
+    skipped_count INTEGER NOT NULL DEFAULT 0,
+    result_json TEXT NOT NULL DEFAULT '{}',
+    drift_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_batch_protocol_status ON compute_batch_protocol_runs(status,expires_at);
+
+-- 预览逐项快照（固定筛选条件后的当前版本、允许动作、拒绝理由）
+CREATE TABLE IF NOT EXISTS compute_batch_protocol_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL REFERENCES compute_batch_protocol_runs(id) ON DELETE CASCADE,
+    task_id INTEGER NOT NULL,
+    position INTEGER NOT NULL,
+    task_version INTEGER,
+    task_status TEXT NOT NULL,
+    allowed INTEGER NOT NULL CHECK(allowed IN (0,1)),
+    allowed_action TEXT NOT NULL DEFAULT '',
+    reject_reason TEXT NOT NULL DEFAULT '',
+    outcome TEXT NOT NULL DEFAULT '' CHECK(outcome IN ('','committed','skipped')),
+    actual_status TEXT NOT NULL DEFAULT '',
+    actual_version INTEGER,
+    intervention_id INTEGER,
+    detail TEXT NOT NULL DEFAULT '',
+    UNIQUE(run_id, task_id)
+);
+CREATE INDEX IF NOT EXISTS idx_batch_protocol_items_run ON compute_batch_protocol_items(run_id,position);
 '''
 
 PERMISSIONS = [

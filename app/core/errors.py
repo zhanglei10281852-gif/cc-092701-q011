@@ -5,10 +5,12 @@ class DomainError(Exception):
     status_code = 400
     code = "domain_error"
 
-    def __init__(self, message: str, *, context: dict | None = None) -> None:
+    def __init__(self, message: str, *, context: dict | None = None, code: str | None = None) -> None:
         super().__init__(message)
         self.message = message
         self.context = context or {}
+        if code:
+            self.code = code
 
 
 class NotFoundError(DomainError):

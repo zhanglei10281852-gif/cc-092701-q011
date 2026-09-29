@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import secrets
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from typing import Any, Callable
 
 from app.compute.repository import ComputeRepository
 from app.core.clock import Clock, SystemClock, to_storage
-from app.core.errors import ConflictError, NotFoundError, ValidationError
+from app.core.errors import ConflictError, NotFoundError, PermissionDeniedError, ValidationError
 from app.database import get_connection, transaction
+from app.repositories.audit import AuditRepository
 
 
 def digest(value: Any) -> str:
@@ -156,19 +158,12 @@ class ComputeOperationsService:
         return self._intervene(task_id, actor, reason, "cancel", batch_key, self._cancel_mutation)
 
     def retry(self, task_id: int, actor: str, reason: str, priority: int | None = None, batch_key: str = "") -> dict[str, Any]:
-        def mutate(connection: sqlite3.Connection, task: sqlite3.Row, now: str) -> None:
-            if task["status"] not in {"failed", "cancelled"}:
-                raise ConflictError("只有失败或已取消任务可以人工重试")
-            chosen = task["priority"] if priority is None else priority
-            connection.execute("UPDATE compute_tasks SET status='queued',priority=?,available_at=?,lease_owner='',lease_expires_at='',finished_at=NULL,updated_at=?,version=version+1 WHERE id=?", (chosen, now, now, task["id"]))
-        return self._intervene(task_id, actor, reason, "retry", batch_key, mutate)
+        action, mutation = self._intervention_mutation("retry", priority)
+        return self._intervene(task_id, actor, reason, action, batch_key, mutation)
 
     def set_priority(self, task_id: int, actor: str, reason: str, priority: int, batch_key: str = "") -> dict[str, Any]:
-        def mutate(connection: sqlite3.Connection, task: sqlite3.Row, now: str) -> None:
-            if task["status"] not in {"queued", "running"}:
-                raise ConflictError("只有排队或运行中的任务可以调整优先级")
-            connection.execute("UPDATE compute_tasks SET priority=?,updated_at=?,version=version+1 WHERE id=?", (priority, now, task["id"]))
-        return self._intervene(task_id, actor, reason, "priority", batch_key, mutate)
+        action, mutation = self._intervention_mutation("priority", priority)
+        return self._intervene(task_id, actor, reason, action, batch_key, mutation)
 
     def batch_operation(self, payload: dict[str, Any]) -> dict[str, Any]:
         batch_key = digest({"actor": payload["actor"], "task_ids": payload["task_ids"], "operation": payload["operation"], "reason": payload["reason"]})
@@ -186,6 +181,453 @@ class ComputeOperationsService:
             except (ConflictError, NotFoundError) as exc:
                 failed.append({"task_id": task_id, "code": exc.code, "message": exc.message})
         return {"batch_key": batch_key, "succeeded": succeeded, "failed": failed}
+
+    # ------------------------------------------------------------------
+    # 两阶段“先查看、后确认”批量协议
+    # ------------------------------------------------------------------
+
+    PROTOCOL_ALLOWED_STATUS = {
+        "cancel": {"queued", "running"},
+        "retry": {"failed", "cancelled"},
+        "priority": {"queued", "running"},
+    }
+    PROTOCOL_REJECT_MESSAGES = {
+        "cancel": "当前任务状态不允许取消",
+        "retry": "只有失败或已取消任务可以人工重试",
+        "priority": "只有排队或运行中的任务可以调整优先级",
+    }
+
+    def preview_batch(self, payload: dict[str, Any]) -> dict[str, Any]:
+        now_value = self.clock.now()
+        now = to_storage(now_value)
+        expires_at = to_storage(now_value + timedelta(seconds=int(payload["ttl_seconds"])))
+        operation = payload["operation"]
+        selection, ordered_ids = self._resolve_selection(payload)
+        if not ordered_ids:
+            raise ValidationError("固定筛选条件后没有命中任何任务")
+        with transaction(immediate=True) as connection:
+            repository = ComputeRepository(connection)
+            items = [self._evaluate_item(repository, task_id, operation, position) for position, task_id in enumerate(ordered_ids)]
+            allowed_count = sum(1 for item in items if item["allowed"])
+            summary = {
+                "actor": payload["actor"],
+                "operation": operation,
+                "reason": payload["reason"],
+                "priority": payload.get("priority"),
+                "execution_mode": payload["execution_mode"],
+                "selection": selection,
+                "items": [
+                    {
+                        "task_id": item["task_id"],
+                        "version": item["version"],
+                        "allowed": item["allowed"],
+                        "action": item["action"],
+                        "reject_reason": item["reject_reason"],
+                    }
+                    for item in items
+                ],
+            }
+            preview_digest = digest(summary)
+            token = secrets.token_urlsafe(32)
+            run = repository.create_protocol_run(
+                token_digest=self._token_digest(token),
+                actor=payload["actor"],
+                operation=operation,
+                reason=payload["reason"],
+                priority=payload.get("priority"),
+                execution_mode=payload["execution_mode"],
+                selection=selection,
+                preview_digest=preview_digest,
+                task_count=len(items),
+                allowed_count=allowed_count,
+                rejected_count=len(items) - allowed_count,
+                previewed_at=now,
+                expires_at=expires_at,
+            )
+            run_id = int(run["id"])
+            for item in items:
+                repository.add_protocol_item(
+                    run_id=run_id,
+                    task_id=item["task_id"],
+                    position=item["position"],
+                    task_version=item["version"],
+                    task_status=item["status"],
+                    allowed=item["allowed"],
+                    allowed_action=item["action"],
+                    reject_reason=item["reject_reason"],
+                )
+            AuditRepository(connection).append(
+                actor_user_id=None,
+                actor_name=payload["actor"],
+                action="compute.batch_protocol.preview",
+                resource_type="compute_batch_protocol_run",
+                resource_id=run_id,
+                outcome="success",
+                before=None,
+                after={"task_count": len(items), "allowed_count": allowed_count, "rejected_count": len(items) - allowed_count},
+                metadata={
+                    "operation": operation,
+                    "execution_mode": payload["execution_mode"],
+                    "selection": selection,
+                    "preview_digest": preview_digest,
+                    "expires_at": expires_at,
+                },
+                correlation_id=f"batch-protocol-{run_id}",
+                created_at=now,
+            )
+        return {
+            "run_id": run_id,
+            "token": token,
+            "preview_digest": preview_digest,
+            "operation": operation,
+            "actor": payload["actor"],
+            "reason": payload["reason"],
+            "priority": payload.get("priority"),
+            "execution_mode": payload["execution_mode"],
+            "selection": selection,
+            "previewed_at": now,
+            "expires_at": expires_at,
+            "task_count": len(items),
+            "allowed_count": allowed_count,
+            "rejected_count": len(items) - allowed_count,
+            "items": [self._public_item(item) for item in items],
+        }
+
+    def confirm_batch(self, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            with transaction(immediate=True) as connection:
+                return self._confirm_batch_in_tx(ComputeRepository(connection), connection, payload)
+        except (ConflictError, PermissionDeniedError) as exc:
+            self._record_confirmation_denial(payload, exc)
+            raise
+
+    def get_protocol_run(self, token: str) -> dict[str, Any]:
+        row = self.repository.protocol_run_by_token_digest(self._token_digest(token))
+        if row is None:
+            raise NotFoundError("批量协议凭据不存在", code="batch_protocol_token_invalid")
+        run = dict(row)
+        now = to_storage(self.clock.now())
+        effective_status = run["status"]
+        if effective_status == "open" and now > run["expires_at"]:
+            effective_status = "expired"
+        items = [dict(item) for item in self.repository.protocol_items(int(run["id"]))]
+        return {
+            "run_id": int(run["id"]),
+            "status": effective_status,
+            "operation": run["operation"],
+            "actor": run["actor"],
+            "reason": run["reason"],
+            "priority": run["priority"],
+            "execution_mode": run["execution_mode"],
+            "selection": json.loads(run["selection_json"]),
+            "preview_digest": run["preview_digest"],
+            "previewed_at": run["previewed_at"],
+            "expires_at": run["expires_at"],
+            "confirmed_at": run["confirmed_at"],
+            "confirmed_by": run["confirmed_by"],
+            "committed_count": int(run["committed_count"]),
+            "skipped_count": int(run["skipped_count"]),
+            "result": json.loads(run["result_json"] or "{}"),
+            "drift": json.loads(run["drift_json"] or "{}"),
+            "items": [
+                {
+                    "task_id": int(item["task_id"]),
+                    "position": int(item["position"]),
+                    "version": item["task_version"],
+                    "status": item["task_status"],
+                    "allowed": bool(item["allowed"]),
+                    "action": item["allowed_action"],
+                    "reject_reason": item["reject_reason"],
+                    "outcome": item["outcome"] or None,
+                    "actual_status": item["actual_status"] or None,
+                    "actual_version": item["actual_version"],
+                    "intervention_id": item["intervention_id"],
+                    "detail": item["detail"] or None,
+                }
+                for item in items
+            ],
+        }
+
+    def _confirm_batch_in_tx(self, repository: ComputeRepository, connection: sqlite3.Connection, payload: dict[str, Any]) -> dict[str, Any]:
+        now = to_storage(self.clock.now())
+        token = payload["token"]
+        run_row = repository.protocol_run_by_token_digest(self._token_digest(token))
+        if run_row is None:
+            raise NotFoundError("批量协议凭据不存在", code="batch_protocol_token_invalid")
+        run = dict(run_row)
+        run_id = int(run["id"])
+        if run["actor"] != payload["actor"]:
+            raise PermissionDeniedError("确认人与预览发起人不一致", context={"run_id": run_id, "preview_actor": run["actor"]}, code="batch_protocol_actor_mismatch")
+        if run["status"] != "open":
+            raise ConflictError("确认凭据只能消费一次", context={"run_id": run_id, "status": run["status"]}, code="batch_protocol_token_consumed")
+        if run["preview_digest"] != payload["preview_digest"]:
+            raise ConflictError(
+                "预览摘要不匹配，确认的不是最近一次预览",
+                context={"run_id": run_id, "expected_preview_digest": run["preview_digest"]},
+                code="batch_protocol_digest_mismatch",
+            )
+
+        operation = run["operation"]
+        priority = run["priority"]
+        reason = run["reason"]
+        actor = payload["actor"]
+        mode = run["execution_mode"]
+        preview_items = [dict(item) for item in repository.protocol_items(run_id)]
+        current_snapshots = {item["task_id"]: self._evaluate_item(repository, int(item["task_id"]), operation, int(item["position"])) for item in preview_items}
+
+        drift: list[dict[str, Any]] = []
+        for preview in preview_items:
+            current = current_snapshots[int(preview["task_id"])]
+            changes: dict[str, Any] = {}
+            if current["version"] is None:
+                changes["deleted"] = {"preview": False, "current": True}
+            else:
+                if preview["task_version"] is None:
+                    changes["deleted"] = {"preview": True, "current": False}
+                elif current["version"] != int(preview["task_version"]):
+                    changes["version"] = {"preview": int(preview["task_version"]), "current": current["version"]}
+                if current["status"] != preview["task_status"]:
+                    changes["status"] = {"preview": preview["task_status"], "current": current["status"]}
+            if changes:
+                changes.update({"currently_allowed": current["allowed"], "reject_reason": current["reject_reason"]})
+                drift.append({"task_id": int(preview["task_id"]), "changes": changes})
+
+        # 过期同样返回逐项差异，便于调用方据此重新发起预览。
+        if now > run["expires_at"]:
+            raise ConflictError(
+                "预览已过期，请重新预览后再确认",
+                context={"run_id": run_id, "previewed_at": run["previewed_at"], "expires_at": run["expires_at"], "confirmed_at": now, "drift": drift},
+                code="batch_protocol_expired",
+            )
+
+        if mode == "abort" and drift:
+            raise ConflictError(
+                "确认时发现任务状态相对预览已漂移，本次未做任何修改",
+                context={"run_id": run_id, "drift": drift},
+                code="batch_protocol_drift",
+            )
+
+        # 原子消费凭据：只有仍开放的凭据可以走到这里，杜绝重复确认。
+        if repository.consume_protocol_token(self._token_digest(token), now=now) != 1:
+            raise ConflictError("确认凭据只能消费一次", context={"run_id": run_id}, code="batch_protocol_token_consumed")
+
+        batch_key = f"protocol:{run_id}"
+        committed: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        action, mutation = self._intervention_mutation(operation, priority)
+        for preview in preview_items:
+            task_id = int(preview["task_id"])
+            current = current_snapshots[task_id]
+            if not bool(preview["allowed"]):
+                skip_reason = f"预览时已拒绝：{preview['reject_reason']}" if preview["reject_reason"] else "预览时已拒绝"
+                repository.record_protocol_item_outcome(
+                    run_id, task_id, outcome="skipped", actual_status=current["status"],
+                    actual_version=current["version"], intervention_id=None, detail=skip_reason,
+                )
+                skipped.append({"task_id": task_id, "reason": skip_reason, "version": current["version"], "status": current["status"]})
+                continue
+            if current["version"] is None:
+                skip_reason = "任务在确认时已不存在"
+            elif current["version"] != int(preview["task_version"]):
+                skip_reason = f"版本已漂移：v{preview['task_version']}→v{current['version']}"
+            elif not current["allowed"]:
+                skip_reason = f"状态已变化：{current['reject_reason']}"
+            else:
+                skip_reason = ""
+            if skip_reason:
+                repository.record_protocol_item_outcome(
+                    run_id, task_id, outcome="skipped", actual_status=current["status"],
+                    actual_version=current["version"], intervention_id=None, detail=skip_reason,
+                )
+                skipped.append({"task_id": task_id, "reason": skip_reason, "version": current["version"], "status": current["status"]})
+                continue
+            task = repository.task_by_id(task_id)
+            after, intervention_id = self._run_intervention_in_tx(
+                repository, connection, task, actor=actor, reason=reason, action=action,
+                mutation=mutation, batch_key=batch_key, now=now,
+            )
+            repository.record_protocol_item_outcome(
+                run_id, task_id, outcome="committed", actual_status=after["status"],
+                actual_version=int(after["version"]), intervention_id=intervention_id, detail="",
+            )
+            committed.append({"task_id": task_id, "status": after["status"], "version": int(after["version"]), "intervention_id": intervention_id})
+
+        result = {"committed": committed, "skipped": skipped}
+        drift_payload = {"items": drift}
+        repository.finalize_protocol_run(
+            run_id, committed_count=len(committed), skipped_count=len(skipped),
+            result=result, drift=drift_payload,
+        )
+        # 记录确认人；与预览审计共用 correlation_id，且逐项干预通过 batch_key/intervention_id 串联。
+        connection.execute(
+            "UPDATE compute_batch_protocol_runs SET confirmed_by=? WHERE id=?",
+            (actor, run_id),
+        )
+        AuditRepository(connection).append(
+            actor_user_id=None,
+            actor_name=actor,
+            action="compute.batch_protocol.confirm",
+            resource_type="compute_batch_protocol_run",
+            resource_id=run_id,
+            outcome="success",
+            before={"allowed_count": int(run["allowed_count"]), "rejected_count": int(run["rejected_count"])},
+            after={"committed_count": len(committed), "skipped_count": len(skipped)},
+            metadata={
+                "operation": operation,
+                "execution_mode": mode,
+                "preview_digest": run["preview_digest"],
+                "committed": committed,
+                "skipped": [{"task_id": item["task_id"], "reason": item["reason"]} for item in skipped],
+                "drift": drift_payload,
+            },
+            correlation_id=f"batch-protocol-{run_id}",
+            created_at=now,
+        )
+        return {
+            "run_id": run_id,
+            "status": "committed",
+            "operation": operation,
+            "execution_mode": mode,
+            "preview_digest": run["preview_digest"],
+            "committed_count": len(committed),
+            "skipped_count": len(skipped),
+            "committed": committed,
+            "skipped": skipped,
+            "drift": drift_payload,
+            "confirmed_by": actor,
+            "confirmed_at": now,
+        }
+
+    def _resolve_selection(self, payload: dict[str, Any]) -> tuple[dict[str, Any], list[int]]:
+        """把显式列表或筛选条件固定为有序、去重的任务集合。"""
+        if payload.get("task_ids") is not None:
+            ordered_ids = list(dict.fromkeys(int(task_id) for task_id in payload["task_ids"]))
+            selection = {"mode": "task_ids", "task_ids": ordered_ids}
+            return selection, ordered_ids
+        filters = payload["filter"]
+        rows = self.repository.list_tasks(
+            status=filters.get("status"),
+            project_code=filters.get("project_code"),
+            requested_by=filters.get("requested_by"),
+            limit=int(filters["limit"]),
+        )
+        ordered_ids = [int(row["id"]) for row in rows]
+        selection = {
+            "mode": "filter",
+            "filter": {
+                "status": filters.get("status"),
+                "project_code": filters.get("project_code"),
+                "requested_by": filters.get("requested_by"),
+                "limit": int(filters["limit"]),
+            },
+            "task_ids": ordered_ids,
+        }
+        return selection, ordered_ids
+
+    def _evaluate_item(self, repository: ComputeRepository, task_id: int, operation: str, position: int) -> dict[str, Any]:
+        task = repository.task_by_id(task_id)
+        if task is None:
+            return {
+                "task_id": task_id, "position": position, "version": None, "status": "",
+                "allowed": False, "action": "", "reject_reason": "计算任务不存在",
+            }
+        status = str(task["status"])
+        allowed = status in self.PROTOCOL_ALLOWED_STATUS[operation]
+        return {
+            "task_id": task_id,
+            "position": position,
+            "version": int(task["version"]),
+            "status": status,
+            "allowed": allowed,
+            "action": operation if allowed else "",
+            "reject_reason": "" if allowed else self.PROTOCOL_REJECT_MESSAGES[operation],
+        }
+
+    @staticmethod
+    def _public_item(item: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "task_id": item["task_id"],
+            "position": item["position"],
+            "version": item["version"],
+            "status": item["status"],
+            "allowed": item["allowed"],
+            "action": item["action"],
+            "reject_reason": item["reject_reason"],
+        }
+
+    @staticmethod
+    def _token_digest(token: str) -> str:
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    def _record_confirmation_denial(self, payload: dict[str, Any], exc: ConflictError) -> None:
+        """漂移/过期等拒绝在主事务回滚后，单独落一条 denied 审计，便于事后解释。"""
+        context = exc.context or {}
+        run_id = context.get("run_id")
+        try:
+            now = to_storage(self.clock.now())
+            with transaction(immediate=True) as connection:
+                AuditRepository(connection).append(
+                    actor_user_id=None,
+                    actor_name=payload.get("actor") or "unknown",
+                    action="compute.batch_protocol.confirm",
+                    resource_type="compute_batch_protocol_run",
+                    resource_id=run_id,
+                    outcome="denied",
+                    before=None,
+                    after=None,
+                    metadata={"reason_code": exc.code, **{key: value for key, value in context.items() if key != "run_id"}},
+                    correlation_id=f"batch-protocol-{run_id}" if run_id is not None else None,
+                    created_at=now,
+                )
+        except Exception:  # 审计失败不能掩盖原始业务拒绝
+            pass
+
+    def _intervention_mutation(self, operation: str, priority: int | None) -> tuple[str, Callable[[sqlite3.Connection, sqlite3.Row, str], None]]:
+        if operation == "cancel":
+            return "cancel", self._cancel_mutation
+
+        if operation == "retry":
+            def retry_mutation(connection: sqlite3.Connection, task: sqlite3.Row, now: str) -> None:
+                if task["status"] not in {"failed", "cancelled"}:
+                    raise ConflictError("只有失败或已取消任务可以人工重试")
+                chosen = task["priority"] if priority is None else priority
+                connection.execute(
+                    "UPDATE compute_tasks SET status='queued',priority=?,available_at=?,lease_owner='',lease_expires_at='',finished_at=NULL,updated_at=?,version=version+1 WHERE id=?",
+                    (chosen, now, now, task["id"]),
+                )
+            return "retry", retry_mutation
+
+        def priority_mutation(connection: sqlite3.Connection, task: sqlite3.Row, now: str) -> None:
+            if task["status"] not in {"queued", "running"}:
+                raise ConflictError("只有排队或运行中的任务可以调整优先级")
+            connection.execute(
+                "UPDATE compute_tasks SET priority=?,updated_at=?,version=version+1 WHERE id=?",
+                (int(priority), now, task["id"]),
+            )
+        return "priority", priority_mutation
+
+    @staticmethod
+    def _run_intervention_in_tx(
+        repository: ComputeRepository,
+        connection: sqlite3.Connection,
+        task: sqlite3.Row,
+        *,
+        actor: str,
+        reason: str,
+        action: str,
+        mutation: Callable[[sqlite3.Connection, sqlite3.Row, str], None],
+        batch_key: str,
+        now: str,
+    ) -> tuple[dict[str, Any], int]:
+        before = dict(task)
+        mutation(connection, task, now)
+        after = dict(repository.task_by_id(int(task["id"])))
+        intervention_id = repository.add_intervention(
+            task_id=int(task["id"]), actor=actor, action=action, reason=reason,
+            before=before, after=after, batch_key=batch_key, now=now,
+        )
+        return after, intervention_id
+
 
     def recover_expired(self, actor: str = "recovery-worker") -> dict[str, Any]:
         now = to_storage(self.clock.now())
