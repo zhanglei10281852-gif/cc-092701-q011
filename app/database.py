@@ -293,6 +293,26 @@ CREATE TABLE IF NOT EXISTS compute_interventions (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_compute_interventions_task ON compute_interventions(task_id,id);
+CREATE TABLE IF NOT EXISTS compute_batch_previews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    preview_key TEXT NOT NULL UNIQUE,
+    actor TEXT NOT NULL,
+    operation TEXT NOT NULL CHECK(operation IN ('cancel','retry','priority')),
+    reason TEXT NOT NULL,
+    priority INTEGER,
+    selector_json TEXT NOT NULL,
+    items_json TEXT NOT NULL,
+    summary_json TEXT NOT NULL,
+    items_digest TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','consumed','expired')),
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    consumed_at TEXT,
+    consumed_by TEXT NOT NULL DEFAULT '',
+    consumed_mode TEXT NOT NULL DEFAULT '',
+    consumed_result_json TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_compute_batch_previews_status ON compute_batch_previews(status,expires_at);
 '''
 
 PERMISSIONS = [

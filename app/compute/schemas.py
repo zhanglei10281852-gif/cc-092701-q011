@@ -80,3 +80,35 @@ class BatchOperation(BaseModel):
         if self.operation == "priority" and self.priority is None:
             raise ValueError("批量调整优先级时必须提供 priority")
         return self
+
+
+class BatchPreviewRequest(BaseModel):
+    operation: Literal["cancel", "retry", "priority"]
+    actor: str = Field(min_length=1, max_length=120)
+    reason: str = Field(min_length=2, max_length=1000)
+    priority: int | None = Field(default=None, ge=0, le=100)
+    task_ids: list[int] | None = Field(default=None, max_length=200)
+    status: str | None = Field(default=None, max_length=40)
+    project_code: str | None = Field(default=None, max_length=80)
+    requested_by: str | None = Field(default=None, max_length=80)
+    ttl_seconds: int = Field(default=600, ge=30, le=3600)
+
+    @model_validator(mode="after")
+    def validate_selector_and_priority(self) -> "BatchPreviewRequest":
+        if self.operation == "priority" and self.priority is None:
+            raise ValueError("批量调整优先级时必须提供 priority")
+        if self.task_ids is not None:
+            if len(self.task_ids) == 0:
+                raise ValueError("task_ids 不能为空")
+            if any(value is not None for value in (self.status, self.project_code, self.requested_by)):
+                raise ValueError("task_ids 与筛选条件不能同时提供")
+        elif not any(value is not None for value in (self.status, self.project_code, self.requested_by)):
+            raise ValueError("必须提供 task_ids 或至少一个筛选条件")
+        return self
+
+
+class BatchConfirmRequest(BaseModel):
+    preview_key: str = Field(min_length=8, max_length=120)
+    actor: str = Field(min_length=1, max_length=120)
+    mode: Literal["atomic", "partial"]
+    expected_digest: str = Field(min_length=8, max_length=128)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import secrets
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from typing import Any, Callable
@@ -10,6 +11,16 @@ from app.compute.repository import ComputeRepository
 from app.core.clock import Clock, SystemClock, to_storage
 from app.core.errors import ConflictError, NotFoundError, ValidationError
 from app.database import get_connection, transaction
+from app.repositories.audit import AuditRepository
+
+
+# 每种人工干预在预览时允许命中的任务状态，必须与下方 mutation 的判定保持一致。
+ACTION_GATES: dict[str, tuple[set[str], str]] = {
+    "cancel": ({"queued", "running"}, "当前任务状态不允许取消"),
+    "retry": ({"failed", "cancelled"}, "只有失败或已取消任务可以人工重试"),
+    "priority": ({"queued", "running"}, "只有排队或运行中的任务可以调整优先级"),
+}
+PREVIEW_LIMIT = 200
 
 
 def digest(value: Any) -> str:
@@ -156,19 +167,157 @@ class ComputeOperationsService:
         return self._intervene(task_id, actor, reason, "cancel", batch_key, self._cancel_mutation)
 
     def retry(self, task_id: int, actor: str, reason: str, priority: int | None = None, batch_key: str = "") -> dict[str, Any]:
-        def mutate(connection: sqlite3.Connection, task: sqlite3.Row, now: str) -> None:
-            if task["status"] not in {"failed", "cancelled"}:
-                raise ConflictError("只有失败或已取消任务可以人工重试")
-            chosen = task["priority"] if priority is None else priority
-            connection.execute("UPDATE compute_tasks SET status='queued',priority=?,available_at=?,lease_owner='',lease_expires_at='',finished_at=NULL,updated_at=?,version=version+1 WHERE id=?", (chosen, now, now, task["id"]))
-        return self._intervene(task_id, actor, reason, "retry", batch_key, mutate)
+        return self._intervene(task_id, actor, reason, "retry", batch_key, self._retry_mutation(priority))
 
     def set_priority(self, task_id: int, actor: str, reason: str, priority: int, batch_key: str = "") -> dict[str, Any]:
-        def mutate(connection: sqlite3.Connection, task: sqlite3.Row, now: str) -> None:
-            if task["status"] not in {"queued", "running"}:
-                raise ConflictError("只有排队或运行中的任务可以调整优先级")
-            connection.execute("UPDATE compute_tasks SET priority=?,updated_at=?,version=version+1 WHERE id=?", (priority, now, task["id"]))
-        return self._intervene(task_id, actor, reason, "priority", batch_key, mutate)
+        return self._intervene(task_id, actor, reason, "priority", batch_key, self._priority_mutation(priority))
+
+    def batch_preview(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """固定筛选条件并逐项给出当前版本、允许动作和拒绝理由，返回一次性确认凭据。"""
+        now_value = self.clock.now()
+        now = to_storage(now_value)
+        expires_at = to_storage(now_value + timedelta(seconds=payload["ttl_seconds"]))
+        selector = self._freeze_selector(payload)
+        preview_key = "bp_" + secrets.token_hex(16)
+        with transaction(immediate=True) as connection:
+            repository = ComputeRepository(connection)
+            tasks, limited = self._select_tasks(repository, selector)
+            items = [
+                self._evaluate_item(task, payload["operation"], task_id)
+                for task_id, task in tasks
+            ]
+            summary = {
+                "total": len(items),
+                "allowed": sum(1 for item in items if item["allowed"]),
+                "rejected": sum(1 for item in items if not item["allowed"]),
+                "limited": limited,
+            }
+            items_digest = digest(items)
+            repository.insert_preview(
+                preview_key=preview_key, actor=payload["actor"], operation=payload["operation"],
+                reason=payload["reason"], priority=payload.get("priority"), selector=selector,
+                items=items, summary=summary, items_digest=items_digest, now=now, expires_at=expires_at,
+            )
+            AuditRepository(connection).append(
+                actor_user_id=None, actor_name=payload["actor"], action="compute.batch_preview",
+                resource_type="compute_batch", resource_id=preview_key, outcome="success",
+                before=None, after={"summary": summary},
+                metadata={"operation": payload["operation"], "reason": payload["reason"], "selector": selector,
+                          "items_digest": items_digest, "ttl_seconds": payload["ttl_seconds"]},
+                correlation_id=preview_key, created_at=now,
+            )
+        return {
+            "preview_key": preview_key, "digest": items_digest, "operation": payload["operation"],
+            "selector": selector, "summary": summary, "items": items,
+            "created_at": now, "expires_at": expires_at,
+        }
+
+    def batch_confirm(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """凭一次性预览凭据执行批量操作；atomic 要求全部可执行，partial 明确接受逐条结果。"""
+        now = to_storage(self.clock.now())
+        rejection: ConflictError | None = None
+        with transaction(immediate=True) as connection:
+            repository = ComputeRepository(connection)
+            audit = AuditRepository(connection)
+            preview = repository.preview_by_key(payload["preview_key"])
+            if preview is None:
+                raise NotFoundError("预览凭据不存在，请重新发起预览")
+            preview_key = preview["preview_key"]
+            if payload["expected_digest"] != preview["items_digest"]:
+                # 摘要不匹配属调用方编程错误，不消费凭据，也不留业务审计。
+                raise ConflictError("预览摘要与确认请求不一致，请重新获取预览", context={
+                    "preview_key": preview_key, "current_digest": preview["items_digest"]})
+            if preview["status"] == "consumed":
+                raise ConflictError("预览凭据只能使用一次", context={
+                    "preview_key": preview_key, "consumed_at": preview["consumed_at"],
+                    "consumed_by": preview["consumed_by"],
+                    "consumed_result": json.loads(preview["consumed_result_json"] or "{}")})
+            items = json.loads(preview["items_json"])
+            drift, current_rows = self._diff_preview(repository, items)
+            expired = preview["expires_at"] < now
+            rejected_items = [
+                {"task_id": item["task_id"], "reject_reason": item["reject_reason"]}
+                for item in items if not item["allowed"]
+            ]
+            rejection_meta = {"preview_created_by": preview["actor"], "confirmed_by": payload["actor"],
+                              "mode": payload["mode"]}
+            if expired:
+                repository.mark_preview_expired(preview["id"])
+                audit.append(
+                    actor_user_id=None, actor_name=payload["actor"], action="compute.batch_confirm_rejected",
+                    resource_type="compute_batch", resource_id=preview_key, outcome="denied",
+                    before=None, after={"reason": "preview_expired", "drift": drift},
+                    metadata=rejection_meta, correlation_id=preview_key, created_at=now,
+                )
+                rejection = ConflictError("预览凭据已过期，请重新获取预览", context={
+                    "preview_key": preview_key, "expired": True,
+                    "expires_at": preview["expires_at"], "drift": drift})
+            elif drift:
+                # 漂移不自动失效凭据：TTL 内调用方仍可核对差异后决定是否重新预览。
+                audit.append(
+                    actor_user_id=None, actor_name=payload["actor"], action="compute.batch_confirm_rejected",
+                    resource_type="compute_batch", resource_id=preview_key, outcome="denied",
+                    before=None, after={"reason": "preview_drift", "drift": drift},
+                    metadata=rejection_meta, correlation_id=preview_key, created_at=now,
+                )
+                rejection = ConflictError("预览后任务状态发生漂移，请重新获取预览", context={
+                    "preview_key": preview_key, "drift": drift})
+            elif payload["mode"] == "atomic" and rejected_items:
+                # 凭据保持未消费：调用方可改用 partial 重新确认，或调整选择条件后重新预览。
+                audit.append(
+                    actor_user_id=None, actor_name=payload["actor"], action="compute.batch_confirm_rejected",
+                    resource_type="compute_batch", resource_id=preview_key, outcome="denied",
+                    before=None, after={"reason": "rejected_items", "rejected": rejected_items},
+                    metadata=rejection_meta, correlation_id=preview_key, created_at=now,
+                )
+                rejection = ConflictError("存在预览时即不允许执行的任务，原子模式已中止", context={
+                    "preview_key": preview_key, "rejected": rejected_items})
+            else:
+                operation = preview["operation"]
+                if operation == "cancel":
+                    mutation = self._cancel_mutation
+                elif operation == "retry":
+                    mutation = self._retry_mutation(preview["priority"])
+                else:
+                    mutation = self._priority_mutation(int(preview["priority"]))
+                applied: list[dict[str, Any]] = []
+                skipped: list[dict[str, Any]] = []
+                # IMMEDIATE 事务已持有写保留锁，漂移复核通过后状态不可能再被其他连接改动。
+                for item, task in zip(items, current_rows, strict=True):
+                    if not item["allowed"]:
+                        # partial 模式：跳过项同样落审计，使事后能解释为什么该条未执行。
+                        if task is not None:
+                            snapshot = dict(task)
+                            repository.add_intervention(
+                                task_id=task["id"], actor=payload["actor"], action="batch_skip",
+                                reason=item["reject_reason"], before=snapshot, after=snapshot,
+                                batch_key=preview_key, now=now,
+                            )
+                        skipped.append({"task_id": item["task_id"], "reject_reason": item["reject_reason"]})
+                        continue
+                    after = self._apply_mutation(connection, repository, task, operation, mutation,
+                                                 preview["reason"], payload["actor"], preview_key, now)
+                    applied.append({"task_id": task["id"], "status": after["status"], "version": after["version"]})
+                result = {
+                    "preview_key": preview_key, "mode": payload["mode"],
+                    "applied": applied, "skipped": skipped,
+                    "summary": {"total": len(items), "applied": len(applied), "skipped": len(skipped)},
+                    "consumed_at": now,
+                }
+                repository.consume_preview(preview["id"], consumed_by=payload["actor"], mode=payload["mode"], result=result, now=now)
+                audit.append(
+                    actor_user_id=None, actor_name=payload["actor"], action="compute.batch_confirm",
+                    resource_type="compute_batch", resource_id=preview_key, outcome="success",
+                    before={"preview_actor": preview["actor"], "summary": json.loads(preview["summary_json"])},
+                    after=result,
+                    metadata={"preview_created_by": preview["actor"], "confirmed_by": payload["actor"],
+                              "operation": operation, "applied": applied, "skipped": skipped},
+                    correlation_id=preview_key, created_at=now,
+                )
+        # 拒绝类审计与过期状态已随事务提交，再向调用方返回错误。
+        if rejection is not None:
+            raise rejection
+        return result
 
     def batch_operation(self, payload: dict[str, Any]) -> dict[str, Any]:
         batch_key = digest({"actor": payload["actor"], "task_ids": payload["task_ids"], "operation": payload["operation"], "reason": payload["reason"]})
@@ -222,18 +371,112 @@ class ComputeOperationsService:
             task = repository.task_by_id(task_id)
             if task is None:
                 raise NotFoundError("计算任务不存在")
-            before = dict(task)
-            mutation(connection, task, now)
-            after = dict(repository.task_by_id(task_id))
-            repository.add_intervention(task_id=task_id, actor=actor, action=action, reason=reason, before=before, after=after, batch_key=batch_key, now=now)
-            return after
+            return self._apply_mutation(connection, repository, task, action, mutation, reason, actor, batch_key, now)
+
+    @staticmethod
+    def _retry_mutation(priority: int | None) -> Callable[[sqlite3.Connection, sqlite3.Row, str], None]:
+        def mutate(connection: sqlite3.Connection, task: sqlite3.Row, now: str) -> None:
+            chosen = task["priority"] if priority is None else priority
+            connection.execute(
+                "UPDATE compute_tasks SET status='queued',priority=?,available_at=?,lease_owner='',lease_expires_at='',finished_at=NULL,updated_at=?,version=version+1 WHERE id=?",
+                (chosen, now, now, task["id"]),
+            )
+        return mutate
+
+    @staticmethod
+    def _priority_mutation(priority: int) -> Callable[[sqlite3.Connection, sqlite3.Row, str], None]:
+        def mutate(connection: sqlite3.Connection, task: sqlite3.Row, now: str) -> None:
+            connection.execute("UPDATE compute_tasks SET priority=?,updated_at=?,version=version+1 WHERE id=?", (priority, now, task["id"]))
+        return mutate
 
     @staticmethod
     def _cancel_mutation(connection: sqlite3.Connection, task: sqlite3.Row, now: str) -> None:
-        if task["status"] not in {"queued", "running"}:
-            raise ConflictError("当前任务状态不允许取消")
         status = "cancel_requested" if task["status"] == "running" else "cancelled"
         connection.execute("UPDATE compute_tasks SET status=?,finished_at=?,updated_at=?,version=version+1 WHERE id=?", (status, None if status == "cancel_requested" else now, now, task["id"]))
+
+    def _apply_mutation(
+        self,
+        connection: sqlite3.Connection,
+        repository: ComputeRepository,
+        task: sqlite3.Row,
+        action: str,
+        mutation: Callable[[sqlite3.Connection, sqlite3.Row, str], None],
+        reason: str,
+        actor: str,
+        batch_key: str,
+        now: str,
+    ) -> dict[str, Any]:
+        allowed_states, gate_message = ACTION_GATES[action]
+        if task["status"] not in allowed_states:
+            raise ConflictError(gate_message)
+        before = dict(task)
+        mutation(connection, task, now)
+        after = dict(repository.task_by_id(task["id"]))
+        repository.add_intervention(task_id=task["id"], actor=actor, action=action, reason=reason, before=before, after=after, batch_key=batch_key, now=now)
+        return after
+
+    @staticmethod
+    def _freeze_selector(payload: dict[str, Any]) -> dict[str, Any]:
+        """把预览请求固定为不可变的选择条件快照。"""
+        if payload.get("task_ids") is not None:
+            return {"task_ids": list(dict.fromkeys(payload["task_ids"]))}
+        return {
+            key: payload[key]
+            for key in ("status", "project_code", "requested_by")
+            if payload.get(key) is not None
+        } | {"limit": PREVIEW_LIMIT}
+
+    def _select_tasks(self, repository: ComputeRepository, selector: dict[str, Any]) -> tuple[list[tuple[int, sqlite3.Row | None]], bool]:
+        if "task_ids" in selector:
+            return [(task_id, repository.task_by_id(task_id)) for task_id in selector["task_ids"]], False
+        rows = [
+            (row["id"], row)
+            for row in repository.list_tasks(
+                status=selector.get("status"), project_code=selector.get("project_code"),
+                requested_by=selector.get("requested_by"), limit=PREVIEW_LIMIT + 1,
+            )
+        ]
+        return rows[:PREVIEW_LIMIT], len(rows) > PREVIEW_LIMIT
+
+    @staticmethod
+    def _evaluate_item(task: sqlite3.Row | None, operation: str, task_id: int) -> dict[str, Any]:
+        if task is None:
+            return {
+                "task_id": task_id, "status": "", "version": 0, "priority": None,
+                "allowed": False, "allowed_action": "", "reject_reason": "计算任务不存在",
+            }
+        allowed_states, reject_reason = ACTION_GATES[operation]
+        allowed = task["status"] in allowed_states
+        return {
+            "task_id": task["id"], "status": task["status"], "version": task["version"],
+            "priority": task["priority"], "allowed": allowed,
+            "allowed_action": operation if allowed else "",
+            "reject_reason": "" if allowed else reject_reason,
+        }
+
+    def _diff_preview(
+        self, repository: ComputeRepository, items: list[dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], list[sqlite3.Row | None]]:
+        """对照预览逐项复核当前版本与状态，返回漂移明细及当前任务行（与 items 对齐）。"""
+        drift: list[dict[str, Any]] = []
+        current_rows: list[sqlite3.Row | None] = []
+        for item in items:
+            task = repository.task_by_id(item["task_id"])
+            if task is None:
+                # version==0 表示预览时任务即不存在：不是漂移，保留为拒绝项。
+                if item["version"] != 0:
+                    drift.append({"task_id": item["task_id"], "kind": "missing",
+                                  "preview": {"version": item["version"], "status": item["status"]}, "current": None})
+                current_rows.append(None)
+                continue
+            current_rows.append(task)
+            if task["version"] != item["version"] or task["status"] != item["status"]:
+                drift.append({
+                    "task_id": item["task_id"], "kind": "changed",
+                    "preview": {"version": item["version"], "status": item["status"]},
+                    "current": {"version": task["version"], "status": task["status"]},
+                })
+        return drift, current_rows
 
     def _check_quota(self, repository: ComputeRepository, requested_by: str, now: datetime) -> None:
         quota = repository.quota("user", requested_by)

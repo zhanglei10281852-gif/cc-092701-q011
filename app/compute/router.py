@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Query
 
-from app.compute.schemas import BatchOperation, CancelRequest, PriorityRequest, QuotaSet, RetryRequest, TaskClaim, TaskFailure, TaskResult, TaskSubmit, TemplateCreate
+from app.compute.schemas import BatchConfirmRequest, BatchOperation, BatchPreviewRequest, CancelRequest, PriorityRequest, QuotaSet, RetryRequest, TaskClaim, TaskFailure, TaskResult, TaskSubmit, TemplateCreate
 from app.compute.service import ComputeOperationsService
 
 router = APIRouter(prefix="/api/compute", tags=["科学计算任务运营"])
@@ -80,6 +80,16 @@ def set_priority(task_id: int, payload: PriorityRequest):
 @router.post("/tasks/batch")
 def batch_operation(payload: BatchOperation):
     return service().batch_operation(payload.model_dump())
+
+
+@router.post("/tasks/batch-preview", status_code=202)
+def batch_preview(payload: BatchPreviewRequest):
+    return service().batch_preview(payload.model_dump())
+
+
+@router.post("/tasks/batch-confirm")
+def batch_confirm(payload: BatchConfirmRequest):
+    return service().batch_confirm(payload.model_dump())
 
 
 @router.post("/recovery/expired-leases")

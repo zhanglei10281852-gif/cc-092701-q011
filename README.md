@@ -64,3 +64,14 @@ tools/              本地维护脚本
 ## 数据一致性
 
 SQLite 连接启用外键、WAL 和忙等待策略。提交、领取、回执和人工干预在即时事务中完成；租约、配额与结果版本使用可注入时钟，便于复现跨日和恢复边界。会话令牌只保存摘要，审计与人工干预记录不会写入明文密码或令牌。
+
+## 先查看、后确认的批量操作
+
+直接调用旧接口 `POST /api/compute/tasks/batch` 会逐条开事务，任务状态中途变化时留下半批成功。需要整批处理时使用两阶段协议：
+
+1. 预览 `POST /api/compute/tasks/batch-preview`：固定 `task_ids` 或筛选条件（`status`/`project_code`/`requested_by`，二者互斥），逐项返回当前 `status`、`version`、`allowed_action` 与 `reject_reason`，并给出一次性凭据 `preview_key`、摘要 `digest`、`summary` 和 `expires_at`（默认 10 分钟）。
+2. 确认 `POST /api/compute/tasks/batch-confirm`：回传 `preview_key`、预览得到的 `expected_digest` 与执行模式：
+   - `atomic`：全部项目预览时即允许且确认时版本无漂移才在单事务内提交，否则整体中止、不留半截结果；
+   - `partial`：明确接受逐条结果，允许的项目执行，拒绝项以 `batch_skip` 干预记录逐条留痕。
+
+凭据只能消费一次：重复确认返回首次消费人与结果；过期会把凭据置为 `expired`；预览后任务版本或状态漂移时返回逐项 `drift` 差异（预览值 vs 当前值），凭据不被消费，可重新预览后再确认。`audit_events` 以 `correlation_id=preview_key` 串联预览事件、确认人、确认结果与拒绝原因，每项实际变化或跳过写入 `compute_interventions`（`batch_key=preview_key`），事后可完整解释某条为何被执行或跳过。

@@ -102,3 +102,43 @@ class ComputeRepository:
             values,
         ).fetchall()
         return [dict(row) for row in rows]
+
+    def insert_preview(
+        self,
+        *,
+        preview_key: str,
+        actor: str,
+        operation: str,
+        reason: str,
+        priority: int | None,
+        selector: dict[str, Any],
+        items: list[dict[str, Any]],
+        summary: dict[str, Any],
+        items_digest: str,
+        now: str,
+        expires_at: str,
+    ) -> dict[str, Any]:
+        self.connection.execute(
+            "INSERT INTO compute_batch_previews(preview_key,actor,operation,reason,priority,selector_json,items_json,summary_json,items_digest,status,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?, 'open',?,?)",
+            (
+                preview_key, actor, operation, reason, priority,
+                json.dumps(selector, ensure_ascii=False, sort_keys=True),
+                json.dumps(items, ensure_ascii=False, sort_keys=True),
+                json.dumps(summary, ensure_ascii=False, sort_keys=True),
+                items_digest, now, expires_at,
+            ),
+        )
+        return self.preview_by_key(preview_key) or {}
+
+    def preview_by_key(self, preview_key: str) -> sqlite3.Row | None:
+        return self.connection.execute("SELECT * FROM compute_batch_previews WHERE preview_key=?", (preview_key,)).fetchone()
+
+    def mark_preview_expired(self, preview_id: int) -> None:
+        self.connection.execute("UPDATE compute_batch_previews SET status='expired' WHERE id=? AND status='open'", (preview_id,))
+
+    def consume_preview(self, preview_id: int, *, consumed_by: str, mode: str, result: dict[str, Any], now: str) -> int:
+        cursor = self.connection.execute(
+            "UPDATE compute_batch_previews SET status='consumed',consumed_at=?,consumed_by=?,consumed_mode=?,consumed_result_json=? WHERE id=? AND status='open'",
+            (now, consumed_by, mode, json.dumps(result, ensure_ascii=False, sort_keys=True), preview_id),
+        )
+        return cursor.rowcount
